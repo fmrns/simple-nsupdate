@@ -1,0 +1,24 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright (c) 2019 Abacus Technologies, Inc.
+# Copyright (c) 2019 Fumiyuki Shimizu
+#
+# MIT License: https://opensource.org/licenses/MIT
+
+[syslog]
+server=syslog.local
+
+[db]
+file=./snsup.db
+
+[nsupdate]
+origin=dynamic.domain.test
+server=192.168.1.1
+ttl=300
+
+[tsig]
+algorithm=hmac-sha256
+name=namae
+key=kagi............=
+
+# end of file
