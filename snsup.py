@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/usr/local/bin/python3.6
 # -*- coding: utf-8 -*-
 #
 # depends: dnspython http://www.dnspython.org/
@@ -23,10 +23,13 @@ import dns.resolver
 import dns.query
 import dns.update
 
-from mod_python import apache
-
 config = configparser.ConfigParser()
-config.read(os.path.dirname(__file__) + '/snsup.ini')
+wd=os.path.dirname(__file__)
+if 1 > len(wd):
+    wd = '.'
+config.read(wd + '/snsup.ini')
+if 'reconfig' in config and 'file' in config['reconfig']:
+    config.read(wd + '/' + config['reconfig'].get('file'))
 
 log_level  = logging.INFO
 #log_level  = logging.DEBUG
@@ -50,7 +53,7 @@ class dbms:
         try:
             self.conn.close()
         except Exception as e:
-            log.debug(f'{e}')
+            log.debug(f'dbms exit: {e}')
         
     def create_table(self):
         self.conn.cursor().executescript('''\
@@ -67,7 +70,7 @@ CREATE INDEX tm_idx ON updated_time(updated);
 ''')
         self.conn.commit()
 
-    def getCursor(self):
+    def get_cursor(self):
         cur = self.conn.cursor()
         #cur.execute(sql_init_tz, ( elconst.SMAME_TZ_IN_NORMAL, ))
         return cur
@@ -75,20 +78,32 @@ CREATE INDEX tm_idx ON updated_time(updated);
     def execute(self, cur, sql, *, arglist=None, commit=True):
         try:
             log.debug('{} {}'.format(sql, arglist))
-            cur.execute(sql, arglist)
+            if arglist is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, arglist)
             if commit:
                 self.conn.commit()
         except sqlite3.Error as e:
             if commit:
                 self.conn.rollback()
-            log.error(f'{e}')
+            log.error(f'dbms execute: {e}')
             raise e
 
     def commit(self):
         try:
             self.conn.commit()
         except sqlite3.Error as e:
-            log.error(f'{e}')
+            log.error(f'dbms commit: {e}')
+            raise e
+
+    def vacuum(self):
+        try:
+            self.conn.commit()
+            cur = self.get_cursor()
+            self.execute(cur, 'VACUUM')
+        except sqlite3.Error as e:
+            log.error(f'dbms vacuum: {e}')
             raise e
 
 class nsupdate:
@@ -99,7 +114,8 @@ class nsupdate:
                 self.keyname: config['tsig'].get('key')
         })
 
-        self.origin = config['nsupdate'].get('origin')
+        self.origin_text = config['nsupdate'].get('origin')
+        self.origin = dns.name.from_text(self.origin_text)
         self.ttl = config['nsupdate'].getint('ttl', 300)
         self.nsupdate_server = config['nsupdate'].get('server')
         self.nsupdate_port = config['nsupdate'].getint('port', 53)
@@ -113,21 +129,27 @@ class nsupdate:
         raise ValueError(f"unknown ipversion: {ipver}")
     
     @staticmethod
-    def ipv_prefix(ipver):
+    def add_prefix(ipver, name):
         if 4 == ipver:
-            return "v4"
+            return dns.name.from_text("v4", origin=dns.name.empty).derelativize(name)
         elif 6 == ipver:
-            return "v6"
+            return dns.name.from_text("v6", origin=dns.name.empty).derelativize(name)
         raise ValueError(f"unknown ipversion: {ipver}")
 
-    def getUpdater(self):
+    def is_subdomain(self, host):
+        return host != self.origin and host.is_subdomain(self.origin)
+
+    def relativize(self, host):
+        return host.relativize(self.origin)
+
+    def get_updater(self):
         return dns.update.Update(
                 self.origin,
                 keyring=self.keyring,
                 keyname=self.keyname,
                 keyalgorithm=self.keyalgorithm)
 
-    def getResolver(self):
+    def get_resolver(self):
         resolver = dns.resolver.Resolver(configure=False)
         resolver.timeout = 20.0
         resolver.nameservers      = [ self.nsupdate_server ]
@@ -135,10 +157,10 @@ class nsupdate:
         return resolver
 
     def _resolve(self, host, ipver):
-        resolver = self.getResolver()
+        resolver = self.get_resolver()
         rrtype = self.rr_type(ipver)
         try:
-            ans = resolver.query(dns.name.from_text(host, origin=dns.name.from_text(self.origin)), rrtype)
+            ans = resolver.query(dns.name.from_text(host, origin=self.origin), rrtype)
             rc = set()
             if ans is not None:
                 for rr in ans:
@@ -157,51 +179,89 @@ class nsupdate:
         rc = set()
         if ipver in (0, 4):
             ans = self._resolve(host, 4)
-            if not ans is None:
+            if ans is not None:
                 rc.update(ans)
         if ipver in (0, 6):
             ans = self._resolve(host, 6)
-            if not ans is None:
+            if ans is not None:
                 rc.update(ans)
         if 1 > len(rc):
             return None
         return rc
 
-    def setips(self, db, host, ipset):
-        h1 = f'{host}'
-        oldipset = set()
-        cur = db.getCursor()
-        db.execute(cur, "SELECT ip FROM updated_time WHERE host=? AND updated>=datetime('now','-1 hour') AND origin=?",
-                        arglist=[ h1, self.origin ])
-        while True:
-            row = cur.fetchone()
-            if row is None:
+    def setips(self, db, host, ipset, filter_ipver=None):
+        host4 = nsupdate.add_prefix(4, host)
+        host6 = nsupdate.add_prefix(6, host)
+        host_text  = host.to_text()
+        host4_text = host4.to_text()
+        host6_text = host6.to_text()
+        log.debug(f'{host}, {host_text}')
+        log.debug(f'{host4}, {host4_text}')
+        log.debug(f'{host6}, {host6_text}')
+        sqls = []
+        if filter_ipver is None:
+            sqls.append(("SELECT ip FROM updated_time WHERE host=? AND updated>=datetime('now','-1 hour')AND origin=?",
+                         host_text, self.origin_text))
+        else:
+            sqls.append(("SELECT ip FROM updated_time WHERE host=? AND updated>=datetime('now','-1 hour')AND ipver=? AND origin=?",
+                         host_text, filter_ipver, self.origin_text))
+            if 4 == filter_ipver:
+                hostp_text = host4_text
+            else:
+                assert 6 == filter_ipver, f'unknown ipver: {filter_ipver}'
+                hostp_text = host6_text
+            sqls.append(("SELECT ip FROM updated_time WHERE host=? AND updated>=datetime('now','-1 hour')AND origin=?",
+                         hostp_text, self.origin_text))
+
+        is_changed = False
+        for sql in sqls:
+            oldipset = set()
+            cur = db.get_cursor()
+            db.execute(cur, sql[0], arglist=sql[1:], commit=False)
+            while True:
+                row = cur.fetchone()
+                if row is None:
+                    break
+                oldipset.add(ipaddress.ip_address(row[0]))
+            if ipset != oldipset:
+                log.info(f'{host_text}: {oldipset - ipset} -> {ipset - oldipset}')
+                is_changed = True
                 break
-            oldipset.add(ipaddress.ip_address(row[0]))
-        if ipset == oldipset:
+        if not is_changed:
             log.debug(f'no change: {host}')
             return
 
-        update = self.getUpdater()
+        update = self.get_updater()
         sqls = []
         ipvers = set()
+        if filter_ipver is None:
+            sqls.append(('DELETE FROM updated_time WHERE(host=? OR host=? OR host=?)AND origin=?',
+                         host_text, host4_text, host6_text, ipver, self.origin_text ))
         for ip in ipset:
             ipaddr = ip.compressed
             ipver = ip.version
             rrtype = nsupdate.rr_type(ipver)
-            h2 = f'{nsupdate.ipv_prefix(ipver)}.{h1}'
+            if 4 == ipver:
+                hostp = host4
+                hostp_text = host4_text
+            else:
+                assert 6 == ipver, f'unknown ipver: {ipver}'
+                hostp = host6
+                hostp_text = host6_text
             if ipver in ipvers:
-                update.add(h1, self.ttl, rrtype, ipaddr)
-                update.add(h2, self.ttl, rrtype, ipaddr)
+                update.add(host,  self.ttl, rrtype, ipaddr)
+                update.add(hostp, self.ttl, rrtype, ipaddr)
             else:
                 ipvers.add(ipver)
-                update.replace(h1, self.ttl, rrtype, ipaddr)
-                update.replace(h2, self.ttl, rrtype, ipaddr)
-                sqls.append(('DELETE FROM updated_time WHERE(host=? OR(host=? AND ipver=?))AND origin=?',
-                             h2, h1, ipver, self.origin ))
+                update.replace(host,  self.ttl, rrtype, ipaddr)
+                update.replace(hostp, self.ttl, rrtype, ipaddr)
+                if filter_ipver is not None:
+                    assert ipver == filter_ipver, f'invalid ipver({ip.compressed}) while ipver is restricted to {filter_ipver}'
+                    sqls.append(('DELETE FROM updated_time WHERE(host=? OR host=? OR host=?)AND ipver=? AND origin=?',
+                                 host_text, host4_text, host6_text, ipver, self.origin_text ))
             sqls.append(('INSERT INTO updated_time(host,origin,ip,ipver)VALUES(?,?,?,?),(?,?,?,?)',
-                         h1, self.origin, ipaddr, ipver,
-                         h2, self.origin, ipaddr, 0 ))
+                         host_text,  self.origin_text, ipaddr, ipver,
+                         hostp_text, self.origin_text, ipaddr, ipver ))
         dns.query.tcp(update, self.nsupdate_server, port=self.nsupdate_port)
 
         for sql in sqls:
@@ -209,9 +269,9 @@ class nsupdate:
         db.commit()
 
     def sweep(self, db):
-        cur = db.getCursor()
+        cur = db.get_cursor()
         db.execute(cur, "SELECT host,ip FROM updated_time WHERE updated<datetime('now','-7 days')AND origin=?",
-                   arglist=[ self.origin ])
+                   arglist=[ self.origin_text ])
         update = None
         pairs = {}
         while True:
@@ -219,7 +279,7 @@ class nsupdate:
             if row is None:
                 break
             if update is None:
-                update = self.getUpdater()
+                update = self.get_updater()
             host = row[0]
             ip = ipaddress.ip_address(row[1])
             if host not in pairs:
@@ -237,77 +297,127 @@ class nsupdate:
             ans = self.resolve(host)
             for ip in pairs[host]:
                 if ans is not None and ip in ans:
+                    log.warn(f'removed host is still resolvable: {host}: {ip}')
                     continue
                 sqls.append(("DELETE FROM updated_time WHERE host=? AND ip=? AND origin=?",
-                             host, ip.compressed, self.origin ))
-                log.info(f'deleting unseen {host}: {ip}')
+                             host, ip.compressed, self.origin_text ))
+                log.warn(f'deleting unseen {host}: {ip}')
 
         for sql in sqls:
             db.execute(cur, sql[0], arglist=sql[1:], commit=False)
         db.commit()
+        db.vacuum()
 
-    def obsolete(self, db, host, ipset=None):
-        cur = db.getCursor()
+    def obsolete(self, db, host, ipset=None, filter_ipver=None):
+        cur = db.get_cursor()
         sqls = []
+        host_text = host.to_text()
+        host4_text = nsupdate.add_prefix(4, host).to_text()
+        host6_text = nsupdate.add_prefix(6, host).to_text()
         if ipset is None or 1 > len(ipset):
-            sqls.append(("UPDATE updated_time SET updated=datetime('now','-1 year')WHERE host=? AND origin=?",
-                         host, self.origin))
+            if filter_ipver is None:
+                sqls.append(("UPDATE updated_time SET updated=datetime('now','-1 year')WHERE(host=? OR host=? OR host=?)AND origin=?",
+                             host_text, host4_text, host6_text, self.origin_text))
+            else:
+                sqls.append(("UPDATE updated_time SET updated=datetime('now','-1 year')WHERE(host=? OR host=? OR host=?)AND ipver=? AND origin=?",
+                             host_text, host4_text, host6_text, filter_ipver, self.origin_text))
         else:
             for ip in ipset:
-                sqls.append(("UPDATE updated_time SET updated=datetime('now','-1 year')WHERE host=? AND ip=? AND origin=?",
-                             host, ip.compressed, self.origin))
+                sqls.append(("UPDATE updated_time SET updated=datetime('now','-1 year')WHERE(host=? OR host=? OR host=?)AND ip=? AND origin=?",
+                             host_text, host4_text, host6_text, ip.compressed, self.origin_text))
         for sql in sqls:
+            log.debug(sql[0])
             db.execute(cur, sql[0], arglist=sql[1:], commit=False)
         db.commit()
         self.sweep(db)
 
-def dispatch(qs, host, remote_ip):
+def dispatch(db, qs, remote_user, remote_addr, http_host):
     snsup = nsupdate()
     is_delete = False
+    filter_ipver = None
+    is_sweep = False
     ipset = set()
+    suffix = None
     if qs is not None and 0 < len(qs):
-        try:
-            for nv in urlparse.parse_qsl(qs):
+        for nv in urlparse.parse_qsl(qs):
+            try:
+                assert 2 == len(nv), f'arg error: {nv[0]}'
+                log.debug(f'{nv[0]}: {nv[1]}')
                 if 'resolve4' == nv[0]:
-                    if 2 == len(nv):
-                        ipset.add(snsup.resolve(nv[1], 4))
+                    ans = snsup.resolve(nv[1], 4)
+                    if ans is not None:
+                        ipset.update(ans)
                 elif 'resolve6' == nv[0]:
-                    if 2 == len(nv):
-                        ipset.add(snsup.resolve(nv[1], 6))
+                    ans = snsup.resolve(nv[1], 6)
+                    if ans is not None:
+                        ipset.update(ans)
                 elif 'resolve' == nv[0]:
-                    if 2 == len(nv):
-                        ipset.add(snsup.resolve(nv[1]))
+                    ans = snsup.resolve(nv[1])
+                    if ans is not None:
+                        ipset.update(ans)
                 elif 'ip' == nv[0]:
-                    if 2 == len(nv):
-                        ipset.add(ipaddress.ip_address(nv[1]))
-                elif 'del' == nv[0]:
-                    is_delete = True
+                    ipset.update(ipaddress.ip_address(nv[1]))
+                elif 'suffix' == nv[0]:
+                    suffix = dns.name.from_text(nv[1], origin=dns.name.empty)
+                elif 'mode' == nv[0]:
+                    if 'delete4' == nv[1]:
+                        is_delete = True
+                        filter_ipver = 4
+                    elif 'delete6' == nv[1]:
+                        is_delete = True
+                        filter_ipver = 6
+                    elif 'delete' == nv[1]:
+                        is_delete = True
+                    elif 'sweep' == nv[1]:
+                        is_sweep = True
+                    else:
+                        log.error(f'unknown mode: {nv[1]}: {remote_user}, {remote_addr}, {qs}')
                 else:
-                    log.error(f'unknown option: {nv[0]}: {host}: {qs}')
-        except Exception as e:
-            log.error(f'{host}: {qs}: {e}')
-            return False
-
+                    log.error(f'unknown option: {nv[0]}: {remote_user}, {remote_addr}, {qs}')
+            except Exception as e:
+                log.warn(f'{remote_user}, {remote_addr}, {qs}: {e}')
+    # defaults
     if 1 > len(ipset):
-        ipset.add(ipaddress.ip_address(remote_ip))
+        ip = ipaddress.ip_address(remote_addr)
+        ipset.add(ip)
+        filter_ipver = ip.version
+        log.debug(f'using remote ip: {ip.compressed}')
+    if suffix is None:
+        server = dns.name.from_text(http_host)
+        p = server.parent()
+        if snsup.is_subdomain(p):
+            suffix = snsup.relativize(p)
+            log.debug(f'using default suffix: {suffix}')
 
+    host = dns.name.from_text(remote_user, origin=dns.name.empty)
+    if suffix is not None:
+        host = host.derelativize(suffix)
+    log.debug(f'host: {host}')
+        
     if is_delete:
-        snsup.obsolete(db, host, ipset)
+        snsup.obsolete(db, host, ipset, filter_ipver)
     else:
-        snsup.setips(db, host, ipset)
+        snsup.setips(db, host, ipset, filter_ipver)
 
-def handler(req):
-#    AddHandler mod_python .py
-#    PythonHandler snsup
-    req.content_type = "text/plain"
-    req.server.server_hostname
+    if is_sweep:
+        snsup.sweep(db)
+
+
+def cgi():
     try:
-        dispatch(req.args, req.user, req.get_remote_host(apache.REMOTE_NOLOOKUP))
-        req.write("OK")
-        return apache.OK
+        print('Content-Type: text/plain; charset=iso-8859-1\n');
+        with dbms() as db:
+            dispatch(db,
+                     os.environ.get('QUERY_STRING'), 
+                     os.environ.get('REMOTE_USER'),
+                     os.environ.get('REMOTE_ADDR'),
+                     os.environ.get('HTTP_HOST'))
+        print('OK')
     except Exception as e:
-        log.error(f'{e}')
-     #   raise apache.SERVER_RETURN, apache.HTTP_INTERNAL_SERVER_ERROR
+        log.error(f'cgi: {e}')
+        print(f'cgi: {e}')
+        import traceback
+        traceback.print_exc()
 
 def test():
     ip4 = ipaddress.ip_address('127.0.0.1')
@@ -321,22 +431,25 @@ def test():
         print (e)
 
 if __name__=='__main__':
-    test()
-
-    dispatch(None, 'test', '10.1.2.3')
-    dispatch('resolve4=homepac.f&resolve6=metal.f', 'test', '10.1.2.3')
-
-    with dbms() as db:
-        db.create_table()
-        snsup = nsupdate()
-        snsup.setips(db, 'test', {
-                ipaddress.ip_address('192.168.33.33'),
-                ipaddress.ip_address('2002:123::'),
-                ipaddress.ip_address('192.168.12.34') })
-        snsup.obsolete(db, 'test', {ipaddress.ip_address('192.168.12.34')})
-        snsup.obsolete(db, 'test')
+    cgi()
 
 
-    print('done.')
+
+#    test()
+#
+#    with dbms() as db:
+#        db.create_table()
+#        dispatch(db, None, 'test', '10.1.2.3', 'xxx.zzz.' + config['nsupdate'].get('origin'))
+#        dispatch(db, 'resolve4=x3.f&resolve6=x4.f', 'test', '10.1.2.3', 'xxx.zzz.' + config['nsupdate'].get('origin'))
+#        dispatch(db, 'mode=delete', 'test', '10.1.2.3',  'xxx.zzz.' + config['nsupdate'].get('origin'))
+#        snsup = nsupdate()
+#        snsup.setips(db, dns.name.from_text('test', origin=dns.name.empty), {
+#                ipaddress.ip_address('192.168.33.33'),
+#                ipaddress.ip_address('2002:123::'),
+#                ipaddress.ip_address('192.168.12.34') })
+#        snsup.obsolete(db, dns.name.from_text('test', origin=dns.name.empty), {ipaddress.ip_address('192.168.12.34')})
+#        snsup.obsolete(db, dns.name.from_text('test', origin=dns.name.empty))
+#
+#    print('done.')
 
 # end of file
